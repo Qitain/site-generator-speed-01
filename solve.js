@@ -22,19 +22,28 @@ const FENCE_OPEN_RE = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
 const FENCE_CLOSE_RE = /^```[ \t]*$/;
 const HEADING_RE = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
 const HR_RE = /^(?:---|\*\*\*)[ \t]*$/;
-const QUOTE_RE = /^>/;
 const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
-const INLINE_SPECIAL_RE = /[\\`*\[]/g;
+const INLINE_SPECIAL_RE = /[\\`*\[&<>"']/g;
 
 function byCodeUnits(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let words = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    // The whitespace code units recognized by JavaScript's \s.
+    const space = c === 32 || (c >= 9 && c <= 13) || c === 160 || c === 5760 ||
+      (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 ||
+      c === 8287 || c === 12288 || c === 65279;
+    if (space) inWord = false;
+    else if (!inWord) { words++; inWord = true; }
+  }
+  return words;
 }
 
 function resolvePath(dir, rel) {
@@ -54,8 +63,10 @@ function dirOf(path) {
 }
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const HTML_SPECIAL_RE = /[&<>"']/;
+const escapedChar = c => ESCAPES[c];
 function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  return HTML_SPECIAL_RE.test(text) ? text.replace(/[&<>"']/g, escapedChar) : text;
 }
 
 function slugify(text) {
@@ -150,15 +161,15 @@ function daysIn(y, m) {
 }
 
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') { close = i; break; }
+  if (text !== '---' && !text.startsWith('---\n')) return { error: 'no front matter' };
+  let close = text.indexOf('\n---', 3);
+  while (close !== -1 && close + 4 !== text.length && text[close + 4] !== '\n') {
+    close = text.indexOf('\n---', close + 1);
   }
   if (close === -1) return { error: 'the front matter is not closed' };
+  const lines = text.slice(0, close).split('\n');
   const data = {};
-  for (let i = 1; i < close; i++) {
+  for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (/^[ \t]*$/.test(line) || line.startsWith('#')) continue;
     const m = LINE_RE.exec(line);
@@ -173,7 +184,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: text.slice(close + 5) };
 }
 
 function headingOf(line) {
@@ -187,58 +198,12 @@ function endsParagraph(line) {
   return BLANK_RE.test(line) || (first === '`' && FENCE_OPEN_RE.test(line)) || headingOf(line) !== null || ((first === '-' || first === '*') && HR_RE.test(line));
 }
 
-const trimLine = line => line.replace(/^[ \t]+|[ \t]+$/g, '');
-
-function lex(src) {
-  const lines = src.split('\n');
-  const tokens = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (BLANK_RE.test(line)) { i++; continue; }
-    const fence = line[0] === '`' ? FENCE_OPEN_RE.exec(line) : null;
-    if (fence !== null) {
-      const body = [];
-      i++;
-      while (i < lines.length && !FENCE_CLOSE_RE.test(lines[i])) body.push(lines[i++]);
-      i++;
-      tokens.push({ type: 'code', lang: fence[1], lines: body });
-      continue;
-    }
-    const heading = headingOf(line);
-    if (heading !== null) { tokens.push({ type: 'heading', depth: heading.depth, text: heading.text }); i++; continue; }
-    if ((line[0] === '-' || line[0] === '*') && HR_RE.test(line)) { tokens.push({ type: 'hr' }); i++; continue; }
-    if (QUOTE_RE.test(line)) {
-      const body = [];
-      while (i < lines.length && QUOTE_RE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
-      tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter(l => l !== '') });
-      continue;
-    }
-    const bullet = BULLET_RE.exec(line);
-    const ordered = bullet === null ? ORDERED_RE.exec(line) : null;
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const marker = isOrdered ? ORDERED_RE : BULLET_RE;
-      const items = [];
-      while (i < lines.length) {
-        const m = marker.exec(lines[i]);
-        if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
-          i++;
-        } else if (CONTINUED_RE.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
-          i++;
-        } else break;
-      }
-      tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered[1]) : 1, items: items.map(parts => parts.join('\n')) });
-      continue;
-    }
-    const body = [trimLine(line)];
-    i++;
-    while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    tokens.push({ type: 'paragraph', text: body.join('\n') });
-  }
-  return tokens;
+function trimLine(line) {
+  const first = line.charCodeAt(0);
+  const last = line.charCodeAt(line.length - 1);
+  if (first !== 32 && first !== 9 && last !== 32 && last !== 9 &&
+      last !== 13 && last !== 0x2028 && last !== 0x2029) return line;
+  return line.replace(/^[ \t]+|[ \t]+$/g, '');
 }
 
 function findUnescaped(s, what, from) {
@@ -268,7 +233,13 @@ function inline(s, env) {
   let out = '';
   let i = 0;
   while (i < s.length) {
+    INLINE_SPECIAL_RE.lastIndex = i;
+    const next = INLINE_SPECIAL_RE.exec(s);
+    if (next === null) return out + s.slice(i);
+    if (next.index > i) out += s.slice(i, next.index);
+    i = next.index;
     const c = s[i];
+    if (ESCAPES[c] !== undefined) { out += ESCAPES[c]; i++; continue; }
     if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) { out += s[i + 1] === '>' ? '&gt;' : s[i + 1]; i += 2; continue; }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
@@ -301,53 +272,84 @@ function inline(s, env) {
       i++;
       continue;
     }
-    const start = i;
-    INLINE_SPECIAL_RE.lastIndex = i + 1;
-    const next = INLINE_SPECIAL_RE.exec(s);
-    i = next === null ? s.length : next.index;
-    out += escapeHtml(s.slice(start, i));
+    out += c;
+    i++;
   }
   return out;
 }
 
 function renderMarkdown(src, env) {
+  const lines = src.split('\n');
   const ids = new Set();
-  const blocks = [];
   const toc = [];
   let excerpt = null;
-  for (const t of lex(src)) {
-    switch (t.type) {
-      case 'heading': {
-        const id = uniqueSlug(slugify(t.text), ids);
-        const html = inline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
-        if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
-        break;
-      }
-      case 'code': {
-        const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        blocks.push(`<pre><code${cls}>${t.lines.map(l => `${escapeHtml(l)}\n`).join('')}</code></pre>`);
-        break;
-      }
-      case 'hr': blocks.push('<hr>'); break;
-      case 'blockquote':
-        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>`);
-        break;
-      case 'list': {
-        const tag = t.ordered ? 'ol' : 'ul';
-        const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        blocks.push(`${open}\n${t.items.map(item => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>`);
-        break;
-      }
-      case 'paragraph': {
-        const html = inline(t.text, env);
-        if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
-        break;
-      }
+  let html = '';
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const first = line[0];
+    if (BLANK_RE.test(line)) { i++; continue; }
+    const fence = first === '`' ? FENCE_OPEN_RE.exec(line) : null;
+    if (fence !== null) {
+      const cls = fence[1] === '' ? '' : ` class="language-${escapeHtml(fence[1])}"`;
+      html += `<pre><code${cls}>`;
+      i++;
+      while (i < lines.length && !FENCE_CLOSE_RE.test(lines[i])) html += `${escapeHtml(lines[i++])}\n`;
+      html += '</code></pre>\n';
+      i++;
+      continue;
     }
+    const heading = headingOf(line);
+    if (heading !== null) {
+      const id = uniqueSlug(slugify(heading.text), ids);
+      const content = inline(heading.text, env);
+      html += `<h${heading.depth} id="${id}">${content}</h${heading.depth}>\n`;
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: content });
+      i++;
+      continue;
+    }
+    if ((first === '-' || first === '*') && HR_RE.test(line)) { html += '<hr>\n'; i++; continue; }
+    if (first === '>') {
+      let text = '';
+      while (i < lines.length && lines[i][0] === '>') {
+        const raw = lines[i++];
+        const part = trimLine(raw.slice(raw[1] === ' ' ? 2 : 1));
+        if (part !== '') text += (text === '' ? '' : '\n') + part;
+      }
+      html += text === '' ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(text, env)}</p>\n</blockquote>\n`;
+      continue;
+    }
+    const bullet = first === '-' || first === '*' ? BULLET_RE.exec(line) : null;
+    const ordered = bullet === null && first >= '0' && first <= '9' ? ORDERED_RE.exec(line) : null;
+    if (bullet !== null || ordered !== null) {
+      const isOrdered = ordered !== null;
+      const marker = isOrdered ? ORDERED_RE : BULLET_RE;
+      const tag = isOrdered ? 'ol' : 'ul';
+      const start = isOrdered ? Number(ordered[1]) : 1;
+      html += isOrdered && start !== 1 ? `<ol start="${start}">\n` : `<${tag}>\n`;
+      let match = bullet ?? ordered;
+      while (match !== null) {
+        let text = trimLine(isOrdered ? match[2] : match[1]);
+        i++;
+        while (i < lines.length) {
+          match = marker.exec(lines[i]);
+          if (match !== null || !CONTINUED_RE.test(lines[i])) break;
+          text += '\n' + trimLine(lines[i++]);
+        }
+        html += `<li>${inline(text, env)}</li>\n`;
+        if (i === lines.length) break;
+      }
+      html += `</${tag}>\n`;
+      continue;
+    }
+    let text = trimLine(line);
+    i++;
+    while (i < lines.length && !endsParagraph(lines[i])) text += '\n' + trimLine(lines[i++]);
+    const content = inline(text, env);
+    if (excerpt === null) excerpt = content;
+    html += `<p>${content}</p>\n`;
   }
-  return { html: blocks.map(b => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 function pathOf(name, text) {
@@ -430,13 +432,8 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
-function lookup(scope, path) {
-  let v = scope[path[0]];
-  for (let k = 1; k < path.length; k++) {
-    if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
-    v = v[path[k]];
-  }
-  return v;
+function getOwn(value, key) {
+  return value !== null && typeof value === 'object' && Object.hasOwn(value, key) ? value[key] : undefined;
 }
 
 function textOf(v) {
@@ -452,43 +449,54 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, scope, ctx, depth) {
-  let out = '';
-  for (const n of nodes) {
-    switch (n.kind) {
-      case 'text': out += n.text; break;
-      case 'var': out += ctx.escape(textOf(lookup(scope, n.path))); break;
-      case 'raw': out += textOf(lookup(scope, n.path)); break;
-      case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
-        break;
-      }
-      case 'for': {
-        const xs = lookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        const inner = Object.create(scope);
-        const loop = { index: 0, first: false, last: false, length: xs.length };
-        inner[n.name] = undefined;
-        inner.loop = loop;
-        for (let k = 0; k < xs.length; k++) {
-          if (n.name !== 'loop') inner[n.name] = xs[k];
-          loop.index = k + 1;
-          loop.first = k === 0;
-          loop.last = k === xs.length - 1;
-          out += renderNodes(n.body, inner, ctx, depth);
+function compileTemplate(nodes) {
+  let serial = 0;
+  const pathOf = (scope, path) => {
+    let code = `${scope}[${JSON.stringify(path[0])}]`;
+    for (let i = 1; i < path.length; i++) code = `getOwn(${code},${JSON.stringify(path[i])})`;
+    return code;
+  };
+  const emit = (body, scope) => {
+    let code = '';
+    let parts = [];
+    const flush = () => {
+      if (parts.length > 0) code += `out+=${parts.join('+')};\n`;
+      parts = [];
+    };
+    for (const n of body) {
+      if (n.kind === 'text') parts.push(JSON.stringify(n.text));
+      else if (n.kind === 'var' || n.kind === 'raw') {
+        const text = `textOf(${pathOf(scope, n.path)})`;
+        parts.push(n.kind === 'var' ? `escapeHtml(${text})` : text);
+      } else {
+        flush();
+        if (n.kind === 'if') {
+          code += `if(${n.not ? '!' : ''}truthy(${pathOf(scope, n.path)})){\n${emit(n.then, scope)}}`;
+          if (n.else !== null) code += `else{\n${emit(n.else, scope)}}`;
+          code += '\n';
+        } else if (n.kind === 'for') {
+          const id = serial++;
+          const xs = `xs${id}`, inner = `s${id}`, loop = `l${id}`, k = `k${id}`;
+          const key = JSON.stringify(n.name);
+          code += `{const ${xs}=${pathOf(scope, n.path)};if(Array.isArray(${xs})){\n`;
+          code += `const ${inner}=Object.create(${scope});const ${loop}={index:0,first:false,last:false,length:${xs}.length};\n`;
+          code += `${inner}[${key}]=undefined;${inner}.loop=${loop};\n`;
+          code += `for(let ${k}=0;${k}<${xs}.length;${k}++){\n`;
+          if (n.name !== 'loop') code += `${inner}[${key}]=${xs}[${k}];\n`;
+          code += `${loop}.index=${k}+1;${loop}.first=${k}===0;${loop}.last=${k}===${xs}.length-1;\n`;
+          code += emit(n.body, inner) + '}}}\n';
+        } else if (n.kind === 'include') {
+          code += `{if(depth<${INCLUDE_DEPTH}){const t=ctx.templates.get(${JSON.stringify(n.name)});if(t!==undefined)out+=t(${scope},ctx,depth+1);}}\n`;
         }
-        break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
-        break;
       }
     }
-  }
-  return out;
+    flush();
+    return code;
+  };
+  // Template text and names enter generated code only as quoted string literals.
+  return new Function('getOwn', 'textOf', 'truthy', 'escapeHtml',
+    `return function(scope,ctx,depth){"use strict";let out="";\n${emit(nodes, 'scope')}return out;}`
+  )(getOwn, textOf, truthy, escapeHtml);
 }
 
 function ownTags(s) {
@@ -508,7 +516,7 @@ export function run(input) {
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
     } catch (err) {
       if (err instanceof Error) report.push(err.message);
       else throw err;
@@ -520,7 +528,7 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -635,10 +643,10 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map(t => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map(p => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
+  const ctx = { templates };
   const render = (name, vars) => {
     const nodes = templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, Object.assign(Object.create(null), { site, tags: allTags, recent, ...vars }), ctx, 0);
+    return nodes === undefined ? null : nodes(Object.assign(Object.create(null), { site, tags: allTags, recent, ...vars }), ctx, 0);
   };
 
   const output = {};
